@@ -61,7 +61,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
 
-
+# 该函数为新增的 tokens 做预处理
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
     tokenizer: transformers.PreTrainedTokenizer,
@@ -71,29 +71,32 @@ def smart_tokenizer_and_embedding_resize(
 
     Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
     """
-    # 在 BERT 分词表上增加新的特殊词
+    # 在 BERT 分词表上增加新的特殊词(special tokens): EOS, PAD, BOS, UNK
     num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    # 增加特殊词后，要重新设置词表的大小
+    # 增加特殊词后，词表的大小也要相应的调整
     model.resize_token_embeddings(len(tokenizer))
 
-    # 如果添加新的符号, 为新的符号分配一个合理的嵌入向量,避免新添加的符号的嵌入向量被随机初始化，导致模型性能下降或不稳定。
+    # 判断是否又新的 token 加入，如果又,则为新的 token 分配一个合理的嵌入向量, 
+    # 避免新添加的符号的嵌入向量被随机初始化，导致模型性能下降或不稳定。
     if num_new_tokens > 0:
-        # 获取模型的输入嵌入层和输出嵌入层的权重矩阵，分别存储在input_embeddings和output_embeddings中。
+        # 获取模型的输入和输出 embedding 层的权重矩阵，分别存储在model 的 input_embeddings和output_embeddings中。
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data
         
-        # 计算原有符号的嵌入向量的平均值，分别存储在input_embeddings_avg和output_embeddings_avg中。
+        # 计算原有输入和输出embedding层的平均值。
         input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
         output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
         
-        # 将新添加的符号的嵌入向量设置为平均值，即用平均值替换权重矩阵中最后几行。
+        # 将新添加的token的嵌入向量设置为平均值，即用平均值替换权重矩阵中最后几行。
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
-# 将一系列字符串转换为模型可以处理的张量的格式, 也就是将原始的文本数据转换为模型可以接受的数值数据，以便进行训练或推理
+# 将字符串序列分词。
+# 输入字符串序列和分词器，输出分词结果。
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
+    # 用分词器对序列中的每一个字符串进行token 化
     tokenized_list = [
         tokenizer(
             text,
@@ -121,35 +124,39 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
 
 
 # 调用上面的 _tokenized_fn 函数对数据进行预处理和分词
+# 输入dataset中的 instruct、input、output、分词器，输出分词结果
 def preprocess(
     sources: Sequence[str],
     targets: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
     """Preprocess the data by tokenizing."""
-    # 将源文本和目标文本拼接成一个完整的示例，其中源文本包含任务说明和输入，目标文本包含输出
+    # 将source文本和target文本拼接成一个完整的sample，其中source文本包含datasets任务说明(instruct)和输入（input），目标文本包含输出（output）
     examples = [s + t for s, t in zip(sources, targets)]
-    # 对每个示例和源文本使用_tokenize_fn函数进行分词，返回输入id、标签、长度
+    # 对每个sample和source文本使用_tokenize_fn函数进行分词，得到输入id、标签、长度
     examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
     input_ids = examples_tokenized["input_ids"]
-    # 将标签复制一份，并将源文本部分的标签设置为忽略索引，因为模型只需要预测目标文本部分的单词
+    # 将标签复制一份，并将source文本部分的标签设置为忽略索引，因为模型只需要预测target文本部分的单词
     labels = copy.deepcopy(input_ids)
     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
         label[:source_len] = IGNORE_INDEX
     return dict(input_ids=input_ids, labels=labels)
 
-# 对应第 1 步, 构建训练集。继承 `Dataset` 这个类
+# Step 1: 构建训练集。继承 `Dataset` 这个类
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
-
+    
+    # 定义初始化函数，输入数据路径和分词器进行初始化
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
-        # 从数据路径中加载数据，数据是一个包含示例的字典的列表，每个示例包含任务说明（instruction）、输入(input)和输出(output)。
+        # 从数据路径中加载数据，每个sample包含任务说明（instruction）、输入(input)和输出(output)。
+        # 数据结构详见 alpaca 的 repo
         list_data_dict = utils.jload(data_path)
 
         logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        # 构建 source 文本和 target 文本，以便调用 preprocess 函数进行预处理
         # 根据输入(input)是否为空，选择不同的提示模板，将任务说明（instruction）和输入(input)格式化为源文本，将输出(output)加上结束符作为目标文本。
         sources = [
             prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
@@ -158,7 +165,7 @@ class SupervisedDataset(Dataset):
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
 
         logging.warning("Tokenizing inputs... This may take some time...")
-        # 调用preprocess函数对源文本和目标文本进行预处理和分词，得到输入id和标签，并将它们作为类的属性
+        # 调用preprocess函数对source文本和target文本进行预处理和分词，得到输入id和标签，并将它们作为类的属性
         data_dict = preprocess(sources, targets, tokenizer)
 
         self.input_ids = data_dict["input_ids"]
@@ -171,14 +178,14 @@ class SupervisedDataset(Dataset):
         return dict(input_ids=self.input_ids[i], labels=self.labels[i])
 
 
-# 对应第 2 步：构建数据整合器 data_collector。将多个数据实例整合成一个批次，并进行填充和掩码处理。
+# Step 2:  data_collector。将多个 sample 整合成一个批次，并进行填充和掩码处理。
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
 
-    # 定义一个可调用方法，接收一个数据实例的序列作为参数，并返回一个批次的张量。
+    # 定义一个可调用方法，接收一个sample的序列作为参数，并返回一个批次的张量。
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         # 从每个数据实例中提取输入id和标签，并将它们组合成元组
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
@@ -194,13 +201,12 @@ class DataCollatorForSupervisedDataset(object):
         )
 
 
-# 将分词器和数据参数转换为训练器可以使用的数据模块。要构建这样一个数据模块分为几步：
-# 1. 构建训练集；2. 如果要评估，则构建评估数据集；3. 构建数据整合器 data_collector
+# 1. 构建训练集；2. 如果要评估，则构建评估数据集；3. 构建 data_collector
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    # 使用分词器和数据参数中的数据路径，创建一个监督数据集的实例，作为训练数据集
+    # 使用分词器和对话数据文本，创建一个pytorch可用的训练集实例
     train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
-    # 创建一个数据整合器的实例，用于将多个数据实例整合成一个批次，并进行填充和掩码处理
+    # 创建一个 datacollector的实例，在 train 过程中调用
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
@@ -211,11 +217,13 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # 加载预训练的模型
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
     )
 
+    # 加载预训练模型对应的分词器
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -223,6 +231,7 @@ def train():
         padding_side="right",
         use_fast=False,
     )
+    # 定义特殊 token
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -233,13 +242,16 @@ def train():
     if tokenizer.unk_token is None:
         special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
 
+    # 定义特殊 token 之后，要对词表做相应的调整
     smart_tokenizer_and_embedding_resize(
         special_tokens_dict=special_tokens_dict,
         tokenizer=tokenizer,
         model=model,
     )
-
+    
+    # 构建训练集
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    # 开始训练：
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
     trainer.save_state()
